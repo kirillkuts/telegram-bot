@@ -1,10 +1,20 @@
 import { Bot, GrammyError, HttpError } from "grammy";
+import type { Context } from "grammy";
 import { loadConfig } from "./config.ts";
 import { runTurn } from "./claudeRunner.ts";
-import { getOrCreate, reset, startIdlePruner, touch } from "./session.ts";
+import {
+  downloadMedia,
+  extractMediaRefs,
+  type DownloadedMedia,
+  type InboundMediaRef,
+} from "./media.ts";
+import { getOrCreate, reset, touch } from "./session.ts";
 
 const MAX_MSG_CHARS = 4000;       // cap below Telegram's 4096 to leave headroom
 const MIN_EDIT_INTERVAL_MS = 1200; // Telegram edit-rate guard
+// Albums: Telegram delivers each photo as a separate update sharing
+// `media_group_id`. Buffer briefly so we process the group as one turn.
+const MEDIA_GROUP_DEBOUNCE_MS = 800;
 
 const cfg = loadConfig();
 const bot = new Bot(cfg.token);
@@ -30,12 +40,27 @@ bot.command("new", async (ctx) => {
   await ctx.reply("Fresh session ready.");
 });
 
-bot.on("message:text", async (ctx) => {
-  const chatId = ctx.chat.id;
+async function handleSingle(ctx: Context): Promise<void> {
+  if (!ctx.chat || !ctx.message) return;
+  const chatId: number = ctx.chat.id;
   if (!allowed(chatId)) return;
 
-  const text = ctx.message.text;
-  if (!text || text.startsWith("/")) return;
+  const text = ctx.message?.text ?? ctx.message?.caption ?? "";
+  if (text.startsWith("/")) return;
+
+  const mediaRefs = extractMediaRefs(ctx);
+  if (!text && mediaRefs.length === 0) return;
+
+  await runTurnForCtx(ctx, text, mediaRefs);
+}
+
+async function runTurnForCtx(
+  ctx: Context,
+  text: string,
+  mediaRefs: InboundMediaRef[],
+): Promise<void> {
+  if (!ctx.chat) return;
+  const chatId: number = ctx.chat.id;
 
   const session = getOrCreate(chatId);
   if (session.inflight) {
@@ -43,6 +68,20 @@ bot.on("message:text", async (ctx) => {
     return;
   }
   session.inflight = true;
+
+  // Download attachments before claiming the placeholder so failures surface early.
+  const media: DownloadedMedia[] = [];
+  for (const ref of mediaRefs) {
+    try {
+      media.push(await downloadMedia(ctx, cfg.token, ref));
+    } catch (err) {
+      session.inflight = false;
+      await ctx.reply(`failed to fetch attachment: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+  }
+
+  const prompt = buildPrompt(text, media);
 
   // Multi-message state: as buffer overflows we finalize current and open new.
   let placeholder = await ctx.reply("…");
@@ -91,7 +130,7 @@ bot.on("message:text", async (ctx) => {
   }
 
   try {
-    for await (const event of runTurn(cfg.projectDir, text, session.sessionId)) {
+    for await (const event of runTurn(cfg.projectDir, prompt, session.sessionId)) {
       if (event.kind === "text-delta") {
         // text-delta carries the running accumulated text from the runner —
         // compute incremental addition relative to what we've already buffered.
@@ -143,6 +182,67 @@ bot.on("message:text", async (ctx) => {
   } finally {
     session.inflight = false;
   }
+}
+
+function buildPrompt(text: string, media: DownloadedMedia[]): string {
+  if (media.length === 0) return text;
+  const refs = media.map((m) => `- ${m.path}`).join("\n");
+  const header = media.length === 1
+    ? `[The user sent an image attached at this path; read it with the Read tool to see it]`
+    : `[The user sent ${media.length} images attached at these paths; read each with the Read tool]`;
+  return text
+    ? `${text}\n\n${header}\n${refs}`
+    : `${header}\n${refs}`;
+}
+
+interface PendingGroup {
+  chatId: number;
+  contexts: Context[];
+  timer: NodeJS.Timeout;
+}
+const pendingGroups = new Map<string, PendingGroup>();
+
+function bufferGroup(chatId: number, groupId: string, ctx: Context): void {
+  const key = `${chatId}:${groupId}`;
+  const existing = pendingGroups.get(key);
+  const fire = (entry: PendingGroup) => {
+    pendingGroups.delete(key);
+    flushGroup(entry.contexts).catch((err) => console.error("flushGroup:", err));
+  };
+  if (existing) {
+    clearTimeout(existing.timer);
+    existing.contexts.push(ctx);
+    existing.timer = setTimeout(() => fire(existing), MEDIA_GROUP_DEBOUNCE_MS);
+    return;
+  }
+  const entry: PendingGroup = { chatId, contexts: [ctx], timer: null as unknown as NodeJS.Timeout };
+  entry.timer = setTimeout(() => fire(entry), MEDIA_GROUP_DEBOUNCE_MS);
+  pendingGroups.set(key, entry);
+}
+
+async function flushGroup(contexts: Context[]): Promise<void> {
+  if (contexts.length === 0) return;
+  const first = contexts[0];
+  // Telegram puts the album caption on (usually) the first message only;
+  // collect any captions just in case clients place it elsewhere.
+  const text = contexts
+    .map((c) => c.message?.caption ?? c.message?.text ?? "")
+    .filter((t) => t.length > 0)
+    .join("\n");
+  const refs = contexts.flatMap((c) => extractMediaRefs(c));
+  if (!text && refs.length === 0) return;
+  await runTurnForCtx(first, text, refs);
+}
+
+bot.on(["message:text", "message:photo", "message:document"], async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (chatId == null || !allowed(chatId)) return;
+  const groupId = ctx.message?.media_group_id;
+  if (groupId) {
+    bufferGroup(chatId, groupId, ctx);
+    return;
+  }
+  await handleSingle(ctx);
 });
 
 bot.catch((err) => {
@@ -155,11 +255,7 @@ bot.catch((err) => {
   }
 });
 
-const pruner = startIdlePruner();
-
 console.log(`telegram-bot starting · cwd=${cfg.projectDir} · allowlist=${[...cfg.allowlist].join(",")}`);
 await bot.start({
   onStart: (info) => console.log(`connected as @${info.username}`),
 });
-
-clearInterval(pruner);

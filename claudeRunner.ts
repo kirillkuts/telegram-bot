@@ -3,8 +3,6 @@ import { createInterface } from "node:readline";
 import { toolUseLabel } from "./renderTool.ts";
 import type { ContentBlock, RunnerEvent, StreamJsonEvent } from "./types.ts";
 
-const TURN_TIMEOUT_MS = 5 * 60_000;
-
 export async function* runTurn(
   cwd: string,
   prompt: string,
@@ -13,6 +11,7 @@ export async function* runTurn(
   const args = [
     ...(resumeId ? ["--resume", resumeId] : []),
     "-p", prompt,
+    "--dangerously-skip-permissions",
     "--verbose",
     "--output-format", "stream-json",
   ];
@@ -24,6 +23,7 @@ export async function* runTurn(
       FORCE_COLOR: "0",
       NO_COLOR: "1",
       CLAUDE_TOOL: "telegram-bot",
+      IS_SANDBOX: "1",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -32,7 +32,9 @@ export async function* runTurn(
   proc.stderr.setEncoding("utf8");
   proc.stderr.on("data", (chunk: string) => { stderr += chunk; });
 
-  const timeout = setTimeout(() => proc.kill("SIGKILL"), TURN_TIMEOUT_MS);
+  // No turn timeout: a turn runs as long as claude needs. The only ways out are
+  // claude exiting on its own, or the chat sending /new (which abandons this
+  // generator and triggers the cleanup kill in the finally below).
 
   // Queue of events produced by the readline parser; consumed by this generator.
   const queue: RunnerEvent[] = [];
@@ -128,7 +130,8 @@ export async function* runTurn(
     const fullText = resultText || accumulated;
     yield { kind: "done", fullText, sessionId };
   } finally {
-    clearTimeout(timeout);
+    // If the consumer stopped iterating (e.g. /new) while claude is still
+    // running, don't leak the subprocess.
     if (proc.exitCode === null) {
       try { proc.kill("SIGKILL"); } catch { /* noop */ }
     }
