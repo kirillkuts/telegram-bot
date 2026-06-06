@@ -67,6 +67,67 @@ If you logged in on the host as a non-root user, point the mount at it, e.g.
 `CLAUDE_DIR=/home/ubuntu/.claude`. Claude's short-lived access token auto-refreshes
 through the bind mount, so it stays valid as long as the volume + network persist.
 
+## Obsidian Sync — setting up the syncer on a new machine
+
+Obsidian sync runs via the headless `ob` client (npm package `obsidian-headless`).
+Each machine is registered as its **own device** of the vault — same account, same
+remote vault, independent local state — exactly like adding a phone or desktop.
+There's nothing to copy between machines; you bootstrap once per machine.
+
+```bash
+# 1. install (needs Node)
+npm install -g obsidian-headless
+
+# 2. log in to your Obsidian account (prompts email, password, MFA if enabled)
+ob login
+
+# 3. find your vault
+ob sync-list-remote
+
+# 4. link a local folder to the remote vault (prompts the E2E encryption password)
+mkdir -p ~/vaults
+ob sync-setup --vault "my awesome vault" --path ~/vaults --device-name "new-machine"
+
+# 5. first sync (downloads the vault, builds local state), then check status
+ob sync
+ob sync-status --path ~/vaults
+```
+
+Run it continuously via systemd (`~/.config/systemd/user/obsidian-sync.service`):
+
+```ini
+[Unit]
+Description=Obsidian Headless Sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/ob sync --continuous
+WorkingDirectory=%h/vaults
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now obsidian-sync.service
+loginctl enable-linger "$USER"   # required on a headless server: run the user service without an active login
+```
+
+You need three secrets per machine: Obsidian account **email + password**, the **MFA
+code** (if 2FA is on), and the **E2E encryption password** (separate from the account
+password).
+
+> **One hard rule:** only one `ob sync` process may run against a given local vault
+> folder / `state.db`. Separate machines syncing the same remote vault is the whole
+> point and is fine; running *two* syncers against the *same* local folder (e.g. a
+> container that bind-mounts a host vault the host is already syncing) corrupts state.
+> On a host that already syncs, just mount the vault into the container and let the
+> host stay the sole syncer — don't start a second `ob sync`.
+
 ## Architecture
 
 ```
