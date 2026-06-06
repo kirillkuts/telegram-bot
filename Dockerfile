@@ -26,6 +26,10 @@ RUN npm ci
 COPY . .
 RUN chmod +x deploy/entrypoint.sh deploy/clone-repos.sh deploy/watchdog.sh
 
+# Ensure the dirs the supervised processes chdir into exist even before any
+# bind mount is attached (obsidian-sync uses /root/vaults; claude uses the workspace).
+RUN mkdir -p /root/vaults /root/workspace
+
 # Default project dir for the spawned claude (overridable via env).
 ENV PROJECT_DIR=/root/workspace
 
