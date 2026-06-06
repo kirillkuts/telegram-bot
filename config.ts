@@ -18,6 +18,19 @@ function readFile(path: string): string | null {
   return readFileSync(path, "utf8").trim();
 }
 
+// Parse chat_ids from a blob that may use commas, whitespace, or newlines as
+// separators (env var) or one-per-line with # comments (file). Lines starting
+// with # are treated as comments.
+function parseAllowlist(raw: string | null, into: Set<number>): void {
+  if (!raw) return;
+  for (const line of raw.split(/[\n,]/)) {
+    const t = line.trim();
+    if (!t || t.startsWith("#")) continue;
+    const n = Number(t);
+    if (Number.isFinite(n)) into.add(n);
+  }
+}
+
 export function loadConfig(): Config {
   const token = process.env.TELEGRAM_BOT_TOKEN || readFile(TOKEN_FILE);
   if (!token) {
@@ -26,29 +39,21 @@ export function loadConfig(): Config {
     );
   }
 
-  const allowlistRaw = readFile(ALLOWLIST_FILE);
+  // Allowlist is the union of the TELEGRAM_ALLOWLIST env var and the file, so
+  // either source (or both) works — env is the container path, file is bare-metal.
   const allowlist = new Set<number>();
-  if (allowlistRaw) {
-    for (const line of allowlistRaw.split("\n")) {
-      const t = line.trim();
-      if (!t || t.startsWith("#")) continue;
-      const n = Number(t);
-      if (Number.isFinite(n)) allowlist.add(n);
-    }
-  }
+  parseAllowlist(process.env.TELEGRAM_ALLOWLIST ?? null, allowlist);
+  parseAllowlist(readFile(ALLOWLIST_FILE), allowlist);
   if (allowlist.size === 0) {
     console.warn(
-      `⚠ Empty allowlist (${ALLOWLIST_FILE}). Only /start will respond — ` +
-      `send /start to your bot to discover your chat_id, then add it.`,
+      `⚠ Empty allowlist (set TELEGRAM_ALLOWLIST or write ${ALLOWLIST_FILE}). ` +
+      `Only /start will respond — send /start to your bot to discover your chat_id, then add it.`,
     );
   }
 
-  const projectDir = readFile(PROJECT_DIR_FILE);
-  if (!projectDir) {
-    throw new Error(
-      `No project_dir set. Write the absolute path to ${PROJECT_DIR_FILE}`,
-    );
-  }
+  // project_dir: env var wins, then file, then a sensible container default.
+  const projectDir =
+    process.env.PROJECT_DIR || readFile(PROJECT_DIR_FILE) || "/root/workspace";
 
   return { token, allowlist, projectDir };
 }

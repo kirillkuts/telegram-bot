@@ -1,0 +1,30 @@
+# Dokploy deploy unit. Set the env vars in the Dokploy dashboard (or a .env file
+# next to this compose). Host paths for the bind mounts are overridable so you can
+# point them at wherever you logged in (e.g. /home/ubuntu/.claude).
+#
+# After the FIRST deploy, authenticate once (see README):
+#   docker exec -it <container> claude            # Claude OAuth
+#   docker exec -it <container> ob login          # Obsidian account
+#   docker exec -it <container> ob sync-setup --path /root/vaults
+services:
+  telegram-bot:
+    build: .
+    image: telegram-bot
+    restart: unless-stopped
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?set TELEGRAM_BOT_TOKEN}
+      TELEGRAM_ALLOWLIST: ${TELEGRAM_ALLOWLIST:-}
+      PROJECT_DIR: ${PROJECT_DIR:-/root/workspace}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      REPOS: ${REPOS:-}
+      GIT_AUTHOR_NAME: ${GIT_AUTHOR_NAME:-kirillkuts}
+      GIT_AUTHOR_EMAIL: ${GIT_AUTHOR_EMAIL:-kirill.kuts.dev@gmail.com}
+    volumes:
+      # Claude auth/refresh — point CLAUDE_DIR at the host dir where you logged in.
+      - ${CLAUDE_DIR:-/root/.claude}:/root/.claude
+      # Obsidian headless auth + sync/E2E state.
+      - ${OBSIDIAN_DIR:-/root/.config/obsidian-headless}:/root/.config/obsidian-headless
+      # The vault content synced by `ob`.
+      - ${VAULTS_DIR:-/root/vaults}:/root/vaults
+      # Cloned repos / Claude project dir.
+      - ${WORKSPACE_DIR:-/root/workspace}:/root/workspace
